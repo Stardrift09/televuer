@@ -229,7 +229,8 @@ class TeleVuerWrapper:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
                        cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
-                       arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw"):
+                       arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw", control_fps: float=90.0, jpeg_quality: int=80,
+                       client: Literal["vuer", "lean"]=None):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
@@ -248,6 +249,9 @@ class TeleVuerWrapper:
         :param arm_reference_mode: str, controls how wrist poses are expressed for IK.
             * "head_position": transfer from WORLD to HEAD with translation adjustment only.
             * "head_yaw": default mode; transfer from WORLD to HEAD with R_Brobot_world_head_yaw^T, ignoring pitch/roll.
+        :param control_fps: float, rate at which the XR client sends hand/controller poses (default: 90.0). See TeleVuer.
+        :param jpeg_quality: int, JPEG quality of the zmq image stream (default: 80).
+        :param client: str, web client run by the headset: "vuer" or "lean". See TeleVuer. Default: env var TELEVUER_CLIENT, else "vuer".
 
         Note:
 
@@ -279,7 +283,8 @@ class TeleVuerWrapper:
         self.arm_reference_mode = arm_reference_mode
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
-                              cert_file=cert_file, key_file=key_file)
+                              cert_file=cert_file, key_file=key_file, control_fps=control_fps, jpeg_quality=jpeg_quality,
+                              client=client)
         
     def get_tele_data(self):
         """

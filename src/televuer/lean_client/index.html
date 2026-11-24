@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TeleVuer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #131416; color: #e8e8e8; font-family: system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #panel { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); text-align: center; }
+  #enter { font-size: 28px; padding: 18px 44px; border: 0; border-radius: 14px; background: #2d7ff9; color: #fff; cursor: pointer; }
+  #enter:disabled { background: #4a4d52; color: #b5b8bd; cursor: default; }
+  #status { margin-top: 12px; font-size: 16px; line-height: 1.5; white-space: pre-line; text-shadow: 0 0 4px #000; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="panel">
+  <button id="enter" disabled>Connecting…</button>
+  <div id="status"></div>
+</div>
+<script>window.TV_VERSION = "__VERSION__";</script>
+<script src="main.js"></script>
+</body>
+</html>

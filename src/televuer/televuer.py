@@ -6,14 +6,128 @@ import asyncio
 import threading
 import cv2
 import os
+import re
+import time
+import hashlib
 from pathlib import Path
 from typing import Literal
+from aiohttp import web
+from .lean import LeanServer
+
+
+# vuer's ImagePlane (rendered by ImageBackground) builds PlaneGeometry(1, 1, img.width, img.height):
+# one quad per pixel, ~1.8 M triangles per eye for a 1280x720 image. That caps the headset at ~22 fps
+# whatever the video rate. The grid is only needed for depth displacement, so the plain branch
+# (no depth map) is served with a single quad.
+_IMAGE_PLANE_GRID = re.compile(r'args:\[1,1,([\w$]+)==null\?void 0:\1\.width,\1==null\?void 0:\1\.height\]')
+
+
+def _patched_vuer_client_files(client_root):
+    """Return {url path: patched JS bytes} for the vuer client files that contain the image plane grid."""
+    client_root = Path(client_root)
+    patched = {}
+    for f in sorted(client_root.glob("assets/**/*.js")):
+        try:
+            src = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "planeGeometry" not in src:
+            continue
+        parts, last = [], 0
+        for m in _IMAGE_PLANE_GRID.finditer(src):
+            if "displacementMap:" in src[m.end():m.end() + 400]:
+                continue  # depth branch: keeps the per-pixel grid for displacement
+            parts += [src[last:m.start()], "args:[1,1,1,1]"]
+            last = m.end()
+        if parts:
+            parts.append(src[last:])
+            patched["/" + f.relative_to(client_root).as_posix()] = "".join(parts).encode("utf-8")
+    return patched
+
+
+class _RateStats:
+    """Pose / video rates measured in the vuer process (enable with TELEVUER_STATS=<seconds>).
+
+    'unique' counts messages whose pose differs from the previous one, i.e. real new samples.
+    'gap' is the largest time between two messages; 'client gap' is the same using the headset's
+    own send timestamps, so a large gap there means the headset itself did not send in time.
+    'N over 30 ms' counts the arrival gaps longer than LATE.
+    """
+    LATE = 0.030
+
+    def __init__(self, interval):
+        self.interval = interval if interval > 0 else 2.0
+        self.streams = {}
+        self.video_frames = 0
+        self.video_dropped = 0
+        self.shown_n, self.shown_sum, self.shown_max = 0, 0.0, 0.0
+        self.client = None  # the lean client's own numbers for the last interval
+        self.ws_pool = {}  # open websockets, set by TeleVuer
+        self._task = None
+
+    def session_started(self):
+        # one report loop per process, however many websocket sessions are open
+        if self._task is None or self._task.done():
+            self._task = asyncio.ensure_future(self.report_loop())
+
+    def tick(self, name, pose, client_ts):
+        now = time.monotonic()
+        cts = client_ts.timestamp() if hasattr(client_ts, "timestamp") else float(client_ts)
+        st = self.streams.setdefault(name, {"n": 0, "unique": 0, "gap": 0.0, "cgap": 0.0, "late": 0, "last": None, "last_t": None, "last_c": None})
+        st["n"] += 1
+        if pose != st["last"]:
+            st["unique"] += 1
+        if st["last_t"] is not None:
+            st["gap"] = max(st["gap"], now - st["last_t"])
+            st["cgap"] = max(st["cgap"], cts - st["last_c"])
+            if now - st["last_t"] > self.LATE:
+                st["late"] += 1
+        st["last"], st["last_t"], st["last_c"] = pose, now, cts
+
+    def video_shown(self, latency):
+        """A video frame was drawn on the headset `latency` seconds after it was sent (lean client)."""
+        self.shown_n += 1
+        self.shown_sum += latency
+        self.shown_max = max(self.shown_max, latency)
+
+    async def report_loop(self):
+        t0 = time.monotonic()
+        while True:
+            await asyncio.sleep(self.interval)
+            dt = time.monotonic() - t0
+            t0 += dt
+            parts = []
+            for name, st in self.streams.items():
+                frozen = " FROZEN" if st["n"] and not st["unique"] else ""
+                late = f", {st['late']} over {self.LATE * 1000:.0f} ms" if st["late"] else ""
+                parts.append(f"{name} {st['n'] / dt:5.1f} Hz (unique {st['unique'] / dt:5.1f}{frozen}) "
+                             f"gap max {st['gap'] * 1000:4.0f} ms (client {st['cgap'] * 1000:4.0f} ms{late})")
+                st.update(n=0, unique=0, gap=0.0, cgap=0.0, late=0)
+            video = f"video {self.video_frames / dt:4.1f} fps"
+            if self.shown_n:
+                video += f" (sent->shown avg {self.shown_sum / self.shown_n * 1000:3.0f} max {self.shown_max * 1000:3.0f} ms)"
+            if self.video_dropped:
+                video += f" dropped {self.video_dropped}"
+            parts.append(f"{video} | open websockets {len(self.ws_pool)}")
+            self.video_frames = self.video_dropped = self.shown_n = 0
+            self.shown_sum = self.shown_max = 0.0
+            print("[TeleVuer stats] " + " | ".join(parts), flush=True)
+            c, self.client = self.client, None
+            if c:
+                try:
+                    print(f"[TeleVuer stats]   headset: XR {c['xr_fps']:5.1f} fps (target {c['target_fps']:g}) gap max {c['xr_gap_ms']:4.0f} ms, "
+                          f"frame work avg {c['frame_ms']:.2f} max {c['frame_max_ms']:.1f} ms, poses skipped {c['pose_skipped']} | "
+                          f"video in {c['video_recv_fps']:4.1f} shown {c['video_shown_fps']:4.1f} fps, dropped {c['video_dropped']}, "
+                          f"decode {c['decode_ms']:.1f} ms, upload avg {c['upload_ms']:.1f} max {c['upload_max_ms']:.1f} ms", flush=True)
+                except (KeyError, TypeError, ValueError):
+                    pass
 
 
 class TeleVuer:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
-                       cert_file: str=None, key_file: str=None):
+                       cert_file: str=None, key_file: str=None, control_fps: float=90.0, jpeg_quality: int=80,
+                       client: Literal["vuer", "lean"]=None):
         """
         TeleVuer class for OpenXR-based XR teleoperate applications.
         This class handles the communication with the Vuer server and manages image and pose data.
@@ -29,6 +143,18 @@ class TeleVuer:
         :param webrtc_url: str, URL for the webrtc offer. must be provided if webrtc is True.
         :param cert_file: str, path to the SSL certificate file.
         :param key_file: str, path to the SSL key file.
+        :param control_fps: float, rate at which the XR client sends hand/controller poses (default: 90.0).
+                            vuer's client default is 30. Poses are sampled once per XR frame, so the effective
+                            rate is capped by the headset refresh rate (72/90 Hz) and drops if the headset browser is busy.
+        :param jpeg_quality: int, JPEG quality of the zmq image stream (default: 80).
+        :param client: str, which web client the headset runs. "vuer": vuer's own client. "lean": TeleVuer's
+                       small WebXR page (see lean.py), which sends one pose message per XR frame and decodes the
+                       images off the main thread, so the pose rate stays at the headset refresh rate while images
+                       are streamed. Same URL, port and pose conventions. It has no webrtc video: with webrtc=True
+                       the vuer client is used. Default: env var TELEVUER_CLIENT, else "vuer".
+
+        Set the env var TELEVUER_STATS=<seconds> to print pose / video rates from the server process.
+        TELEVUER_PORT changes the port (default 8012).
 
         Note:
 
@@ -58,6 +184,8 @@ class TeleVuer:
             raise ValueError("[TeleVuer] img_shape must be provided.")
         self.img_shape = (img_shape[0], img_shape[1], 3)
         self.display_fps = display_fps
+        self.control_fps = control_fps
+        self.jpeg_quality = int(jpeg_quality)
         self.img_height = self.img_shape[0]
         if self.binocular:
             self.img_width  = self.img_shape[1] // 2
@@ -88,57 +216,42 @@ class TeleVuer:
                     cert_file = cert_file or str(current_module_dir / "cert.pem")
                     key_file = key_file or str(current_module_dir / "key.pem")
 
-        self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
-        self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
-        if self.use_hand_tracking:
-            self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
-        else:
-            self.vuer.add_handler("CONTROLLER_MOVE")(self.on_controller_move)
-
+        if display_mode not in ("immersive", "ego", "pass-through"):
+            raise ValueError(f"[TeleVuer] Unknown display_mode: {display_mode}")
         self.display_mode = display_mode
         self.zmq = zmq
         self.webrtc = webrtc
         self.webrtc_url = webrtc_url
+        port = int(os.getenv("TELEVUER_PORT", "8012"))
+        self._stats = _RateStats(float(os.getenv("TELEVUER_STATS", "0") or 0)) if os.getenv("TELEVUER_STATS") else None
 
-        if self.display_mode == "immersive":
-            if self.webrtc:
-                fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
-            elif self.zmq:
-                self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
-                self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
-                self.latest_frame = None
-                self.new_frame_event = threading.Event()
-                self.stop_writer_event = threading.Event()
-                self.writer_thread = threading.Thread(target=self._xr_render_loop, daemon=True)
-                self.writer_thread.start()
-                fn = self.main_image_binocular_zmq if self.binocular else self.main_image_monocular_zmq
-            else:
-                raise ValueError("[TeleVuer] immersive mode requires zmq=True or webrtc=True.")
-        elif self.display_mode == "ego":
-            if self.webrtc:
-                fn = self.main_image_binocular_webrtc_ego if self.binocular else self.main_image_monocular_webrtc_ego
-            elif self.zmq:
-                self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
-                self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
-                self.latest_frame = None
-                self.new_frame_event = threading.Event()
-                self.stop_writer_event = threading.Event()
-                self.writer_thread = threading.Thread(target=self._xr_render_loop, daemon=True)
-                self.writer_thread.start()
-                fn = self.main_image_binocular_zmq_ego if self.binocular else self.main_image_monocular_zmq_ego
-            else:
-                raise ValueError("[TeleVuer] ego mode requires zmq=True or webrtc=True.")
-        elif self.display_mode == "pass-through":
-            fn = self.main_pass_through
+        client = (client or os.getenv("TELEVUER_CLIENT") or "vuer").lower()
+        if client not in ("vuer", "lean"):
+            raise ValueError(f"[TeleVuer] Unknown client: {client}")
+        if client == "lean" and self.webrtc and self.display_mode != "pass-through":
+            print("[TeleVuer] The lean client has no webrtc video, using the vuer client.")
+            client = "vuer"
+        self.client = client
+
+        if self.client == "lean":
+            self.vuer = None
+            if self.display_mode != "pass-through":
+                if not self.zmq:
+                    raise ValueError(f"[TeleVuer] {self.display_mode} mode requires zmq=True or webrtc=True.")
+                self._setup_jpeg_pipe()
+            self._lean = LeanServer(self, cert_file, key_file, port=port)
+            if self._stats is not None:
+                self._stats.ws_pool = self._lean.open_ws
+            server_main = self._lean.run
         else:
-            raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
-        
-        self.vuer.spawn(start=False)(fn)
+            self._setup_vuer(cert_file, key_file, port)
+            server_main = self._vuer_run
 
         self.head_pose_shared = Array('d', 16, lock=True)
         self.left_arm_pose_shared = Array('d', 16, lock=True)
         self.right_arm_pose_shared = Array('d', 16, lock=True)
         self.motion_data_ready_shared = Value('b', False, lock=True)
+        self.motion_data_time_shared = Value('d', 0.0, lock=True)  # time.monotonic() of the last hand / controller data
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
             self.right_hand_position_shared = Array('d', 75, lock=True)
@@ -173,10 +286,43 @@ class TeleVuer:
             self.right_ctrl_aButton_shared = Value('b', False, lock=True)
             self.right_ctrl_bButton_shared = Value('b', False, lock=True)
 
-        self.process = Process(target=self._vuer_run)
+        self.process = Process(target=server_main)
         self.process.daemon = True
         self.process.start()
     
+    def _setup_vuer(self, cert_file, key_file, port):
+        self.vuer = Vuer(host='0.0.0.0', port=port, cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        if not os.getenv("TELEVUER_NO_CLIENT_PATCH"):
+            self._serve_patched_client()
+        self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
+        if self.use_hand_tracking:
+            self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
+        else:
+            self.vuer.add_handler("CONTROLLER_MOVE")(self.on_controller_move)
+
+        if self.display_mode == "immersive":
+            if self.webrtc:
+                fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
+            elif self.zmq:
+                self._setup_jpeg_pipe()
+                fn = self.main_image_binocular_zmq if self.binocular else self.main_image_monocular_zmq
+            else:
+                raise ValueError("[TeleVuer] immersive mode requires zmq=True or webrtc=True.")
+        elif self.display_mode == "ego":
+            if self.webrtc:
+                fn = self.main_image_binocular_webrtc_ego if self.binocular else self.main_image_monocular_webrtc_ego
+            elif self.zmq:
+                self._setup_jpeg_pipe()
+                fn = self.main_image_binocular_zmq_ego if self.binocular else self.main_image_monocular_zmq_ego
+            else:
+                raise ValueError("[TeleVuer] ego mode requires zmq=True or webrtc=True.")
+        elif self.display_mode == "pass-through":
+            fn = self.main_pass_through
+
+        if self._stats is not None:
+            self._stats.ws_pool = self.vuer.ws
+        self.vuer.spawn(start=False)(self._with_stats(fn))
+
     def _vuer_run(self):
         try:
             self.vuer.run()
@@ -188,17 +334,94 @@ class TeleVuer:
             if hasattr(self, "stop_writer_event"):
                 self.stop_writer_event.set()
 
+    def _serve_patched_client(self):
+        """Serve the patched vuer client files (see _IMAGE_PLANE_GRID). Registered before vuer adds its
+        /assets static route, so these paths win. no-cache makes headsets revalidate instead of reusing
+        a heuristically cached unpatched copy on later visits."""
+        files = _patched_vuer_client_files(self.vuer.client_root)
+        if not files:
+            print("[TeleVuer] Warning: vuer client image plane not found, not patched; large images will render slowly on the headset.")
+            return
+        for path, body in files.items():
+            etag = '"tv-%s"' % hashlib.sha1(body).hexdigest()[:16]
+
+            async def handler(request, body=body, etag=etag):
+                headers = {"Cache-Control": "no-cache", "ETag": etag}
+                if request.headers.get("If-None-Match") == etag:
+                    return web.Response(status=304, headers=headers)
+                return web.Response(body=body, content_type="application/javascript", headers=headers)
+
+            self.vuer._add_route(path, handler)
+
+    def _setup_jpeg_pipe(self):
+        """JPEG frames are encoded here, in the caller's process, and handed to the vuer process
+        through shared memory, so the vuer event loop (which also receives the poses) never encodes."""
+        n_eyes = 2 if self.binocular else 1
+        self.jpeg_slot_size = self.img_height * self.img_width * 3  # raw size: upper bound for one JPEG
+        self.jpeg_shm = shared_memory.SharedMemory(create=True, size=self.jpeg_slot_size * n_eyes)
+        self.jpeg_lens = Array('i', n_eyes, lock=False)
+        self.jpeg_seq = Value('L', 0, lock=True)  # its lock guards jpeg_shm + jpeg_lens too
+        self.latest_frame = None
+        self.new_frame_event = threading.Event()
+        self.stop_writer_event = threading.Event()
+        self.writer_thread = threading.Thread(target=self._xr_render_loop, daemon=True)
+        self.writer_thread.start()
+
     def _xr_render_loop(self):
+        params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+        slot = self.jpeg_slot_size
         while not self.stop_writer_event.is_set():
             if not self.new_frame_event.wait(timeout=0.1):
                 continue
             self.new_frame_event.clear()
-            if self.latest_frame is None:
+            frame = self.latest_frame
+            if frame is None:
                 continue
-            latest_frame = self.latest_frame
-            latest_frame = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
-            self.img2display[:] = latest_frame
-    
+            try:
+                # frame is BGR, which is what cv2.imencode expects
+                eyes = (frame[:, :self.img_width], frame[:, self.img_width:]) if self.binocular else (frame,)
+                encoded = [cv2.imencode(".jpg", eye, params)[1] for eye in eyes]
+                if any(len(b) > slot for b in encoded):
+                    continue
+                with self.jpeg_seq.get_lock():
+                    for k, b in enumerate(encoded):
+                        self.jpeg_shm.buf[k * slot: k * slot + len(b)] = b
+                        self.jpeg_lens[k] = len(b)
+                    self.jpeg_seq.value += 1
+            except Exception as e:
+                print(f"[TeleVuer] Failed to encode frame of shape {getattr(frame, 'shape', None)}: {e}")
+
+    async def _jpeg_frames(self):
+        """Yield each new camera frame (one JPEG per eye) once, at most display_fps times per second."""
+        slot = self.jpeg_slot_size
+        period = 1.0 / self.display_fps
+        last_seq, next_send = 0, 0.0
+        while True:
+            delay = next_send - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            with self.jpeg_seq.get_lock():
+                seq = self.jpeg_seq.value
+                if seq != last_seq:
+                    jpegs = [bytes(self.jpeg_shm.buf[k * slot: k * slot + self.jpeg_lens[k]]) for k in range(len(self.jpeg_lens))]
+            if seq == last_seq:
+                await asyncio.sleep(0.002)
+                continue
+            last_seq = seq
+            # average send interval >= period; after an idle stretch the next frame may go out at once
+            next_send = max(next_send + period, time.monotonic() - 0.5 * period)
+            if self._stats is not None:
+                self._stats.video_frames += 1
+            yield jpegs
+
+    def _with_stats(self, fn):
+        if self._stats is None:
+            return fn
+        async def run(session):
+            self._stats.session_started()
+            await fn(session)
+        return run
+
     def render_to_xr(self, image):
         if self.webrtc or self.display_mode == "pass-through":
             print("[TeleVuer] Warning: render_to_xr is ignored when webrtc is enabled or pass_through is True.")
@@ -209,13 +432,13 @@ class TeleVuer:
     def close(self):
         self.process.terminate()
         self.process.join(timeout=0.5)
-        if self.display_mode in ("immersive", "ego") and not self.webrtc:
+        if hasattr(self, "writer_thread"):
             self.stop_writer_event.set()
             self.new_frame_event.set()
             self.writer_thread.join(timeout=0.5)
             try:
-                self.img2display_shm.close()
-                self.img2display_shm.unlink()
+                self.jpeg_shm.close()
+                self.jpeg_shm.unlink()
             except:
                 pass
 
@@ -223,6 +446,8 @@ class TeleVuer:
         try:
             with self.head_pose_shared.get_lock():
                 self.head_pose_shared[:] = event.value["camera"]["matrix"]
+            if self._stats is not None:
+                self._stats.tick("CAMERA_MOVE", event.value["camera"]["matrix"], event.ts)
         except:
             pass
 
@@ -262,8 +487,12 @@ class TeleVuer:
 
             extract_controllers(left_controller, "left")
             extract_controllers(right_controller, "right")
+            with self.motion_data_time_shared.get_lock():
+                self.motion_data_time_shared.value = time.monotonic()
             with self.motion_data_ready_shared.get_lock():
                 self.motion_data_ready_shared.value = True
+            if self._stats is not None:
+                self._stats.tick("CONTROLLER_MOVE", (event.value["left"], event.value["right"]), event.ts)
         except:
             pass
 
@@ -310,8 +539,12 @@ class TeleVuer:
             extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
             extract_hands(left_hand, "left")
             extract_hands(right_hand, "right")
+            with self.motion_data_time_shared.get_lock():
+                self.motion_data_time_shared.value = time.monotonic()
             with self.motion_data_ready_shared.get_lock():
                 self.motion_data_ready_shared.value = True
+            if self._stats is not None:
+                self._stats.tick("HAND_MOVE", (left_hand_data, right_hand_data), event.ts)
 
         except:
             pass
@@ -322,6 +555,7 @@ class TeleVuer:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -332,17 +566,18 @@ class TeleVuer:
             session.upsert(
                 MotionControllers(
                     stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
                 ),
                 to="bgChildren",
             )
-        while True:
+        async for jpegs in self._jpeg_frames():
             session.upsert(
                 [
                     ImageBackground(
-                        self.img2display[:, :self.img_width],
+                        src=jpegs[0],
                         aspect=self.aspect_ratio,
                         height=1,
                         distanceToCamera=1,
@@ -350,33 +585,28 @@ class TeleVuer:
                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
                         layers=1,
-                        format="jpeg",
-                        quality=80,
                         key="background-left",
                         interpolate=True,
                     ),
                     ImageBackground(
-                        self.img2display[:, self.img_width:],
+                        src=jpegs[1],
                         aspect=self.aspect_ratio,
                         height=1,
                         distanceToCamera=1,
                         layers=2,
-                        format="jpeg",
-                        quality=80,
                         key="background-right",
                         interpolate=True,
                     ),
                 ],
                 to="bgChildren",
             )
-            # 'jpeg' encoding should give you about 30fps with a 16ms wait in-between.
-            await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_zmq(self, session):
         if self.use_hand_tracking:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -386,7 +616,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -394,29 +625,27 @@ class TeleVuer:
                 to="bgChildren",
             )
 
-        while True:
+        async for jpegs in self._jpeg_frames():
             session.upsert(
                 [
                     ImageBackground(
-                        self.img2display,
+                        src=jpegs[0],
                         aspect=self.aspect_ratio,
                         height=1,
                         distanceToCamera=1,
-                        format="jpeg",
-                        quality=80,
                         key="background-mono",
                         interpolate=True,
                     ),
                 ],
                 to="bgChildren",
             )
-            await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc(self, session):
         if self.use_hand_tracking:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -426,7 +655,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -454,6 +684,7 @@ class TeleVuer:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -463,7 +694,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -491,6 +723,7 @@ class TeleVuer:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -501,17 +734,18 @@ class TeleVuer:
             session.upsert(
                 MotionControllers(
                     stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
                 ),
                 to="bgChildren",
             )
-        while True:
+        async for jpegs in self._jpeg_frames():
             session.upsert(
                 [
                     ImageBackground(
-                        self.img2display[:, :self.img_width],
+                        src=jpegs[0],
                         aspect=self.aspect_ratio,
                         height=0.75,
                         distanceToCamera=2,
@@ -519,33 +753,28 @@ class TeleVuer:
                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
                         layers=1,
-                        format="jpeg",
-                        quality=80,
                         key="background-left",
                         interpolate=True,
                     ),
                     ImageBackground(
-                        self.img2display[:, self.img_width:],
+                        src=jpegs[1],
                         aspect=self.aspect_ratio,
                         height=0.75,
                         distanceToCamera=2,
                         layers=2,
-                        format="jpeg",
-                        quality=80,
                         key="background-right",
                         interpolate=True,
                     ),
                 ],
                 to="bgChildren",
             )
-            # 'jpeg' encoding should give you about 30fps with a 16ms wait in-between.
-            await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_zmq_ego(self, session):
         if self.use_hand_tracking:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -555,7 +784,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -563,29 +793,27 @@ class TeleVuer:
                 to="bgChildren",
             )
 
-        while True:
+        async for jpegs in self._jpeg_frames():
             session.upsert(
                 [
                     ImageBackground(
-                        self.img2display,
+                        src=jpegs[0],
                         aspect=self.aspect_ratio,
                         height=0.75,
                         distanceToCamera=2,
-                        format="jpeg",
-                        quality=80,
                         key="background-mono",
                         interpolate=True,
                     ),
                 ],
                 to="bgChildren",
             )
-            await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc_ego(self, session):
         if self.use_hand_tracking:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -595,7 +823,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -623,6 +852,7 @@ class TeleVuer:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -632,7 +862,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -660,6 +891,7 @@ class TeleVuer:
             session.upsert(
                 Hands(
                     stream=True,
+                    fps=self.control_fps,
                     key="hands",
                     hideLeft=True,
                     hideRight=True
@@ -669,7 +901,8 @@ class TeleVuer:
         else:
             session.upsert(
                 MotionControllers(
-                    stream=True, 
+                    stream=True,
+                    fps=self.control_fps,
                     key="motionControllers",
                     left=True,
                     right=True,
@@ -677,7 +910,7 @@ class TeleVuer:
                 to="bgChildren",
             )
 
-        while True:
+        while session.CURRENT_WS_ID in self.vuer.ws:
             await asyncio.sleep(1.0 / self.display_fps)
 
     # ==================== common data ====================
@@ -874,3 +1107,12 @@ class TeleVuer:
         """bool, whether at least one hand or controller motion data event has been received."""
         with self.motion_data_ready_shared.get_lock():
             return self.motion_data_ready_shared.value
+
+    @property
+    def motion_data_age(self):
+        """float, seconds since the last hand or controller motion data arrived (inf if none yet).
+        The lean client only sends while the headset is rendering XR frames, so this grows as soon as
+        the headset is taken off, the session ends or the link drops."""
+        with self.motion_data_time_shared.get_lock():
+            t = self.motion_data_time_shared.value
+        return time.monotonic() - t if t > 0 else float("inf")
